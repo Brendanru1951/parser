@@ -1,0 +1,355 @@
+import tkinter as tk
+from tkinter import ttk, messagebox, scrolledtext, filedialog
+import requests
+import os
+import json
+import csv
+import threading
+import time
+
+BASE_URL = "https://www.bizupon.com"
+API_RUSSIA = f"{BASE_URL}/jquerydata.asmx/Russiahsearch"
+IMG_BASE = f"{BASE_URL}/car/small/"
+
+
+def _select_all(widget):
+    widget.selection_range(0, tk.END)
+    widget.icursor(tk.END)
+
+
+def attach_clipboard(widget):
+    """Контекстное меню и горячие клавиши для копирования/вставки."""
+    menu = tk.Menu(widget, tearoff=0)
+    menu.add_command(label="Вырезать", command=lambda: widget.event_generate("<<Cut>>"))
+    menu.add_command(label="Копировать", command=lambda: widget.event_generate("<<Copy>>"))
+    menu.add_command(label="Вставить", command=lambda: widget.event_generate("<<Paste>>"))
+    menu.add_separator()
+    menu.add_command(label="Выделить всё", command=lambda: _select_all(widget))
+
+    def show_menu(event):
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    widget.bind("<Button-3>", show_menu)
+    widget.bind("<Button-2>", show_menu)
+    widget.bind("<Control-v>", lambda e: widget.event_generate("<<Paste>>"))
+    widget.bind("<Control-V>", lambda e: widget.event_generate("<<Paste>>"))
+    widget.bind("<Shift-Insert>", lambda e: widget.event_generate("<<Paste>>"))
+    widget.bind("<Control-c>", lambda e: widget.event_generate("<<Copy>>"))
+    widget.bind("<Control-C>", lambda e: widget.event_generate("<<Copy>>"))
+    widget.bind("<Control-Insert>", lambda e: widget.event_generate("<<Copy>>"))
+    widget.bind("<Control-x>", lambda e: widget.event_generate("<<Cut>>"))
+    widget.bind("<Control-X>", lambda e: widget.event_generate("<<Cut>>"))
+    widget.bind("<Control-a>", lambda e: _select_all(widget))
+    widget.bind("<Control-A>", lambda e: _select_all(widget))
+
+
+class BizuponParserApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Bizupon Parser (API)")
+        self.root.geometry("800x740")
+
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) "
+                          "Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "X-Requested-With": "XMLHttpRequest",
+            "Origin": BASE_URL,
+            "Referer": f"{BASE_URL}/ourstock",
+        })
+
+        self.create_widgets()
+
+    # ---------- UI ----------
+    def create_widgets(self):
+        # Авторизация
+        auth_frame = ttk.LabelFrame(self.root, text="Авторизация (если требуется)", padding=10)
+        auth_frame.pack(fill="x", padx=10, pady=5)
+
+        ttk.Label(auth_frame, text="User ID / Email:").grid(row=0, column=0, sticky="w")
+        self.entry_user = ttk.Entry(auth_frame, width=30)
+        self.entry_user.grid(row=0, column=1, padx=5, pady=2)
+        attach_clipboard(self.entry_user)
+
+        ttk.Label(auth_frame, text="Password:").grid(row=1, column=0, sticky="w")
+        self.entry_pass = ttk.Entry(auth_frame, width=30, show="*")
+        self.entry_pass.grid(row=1, column=1, padx=5, pady=2)
+        attach_clipboard(self.entry_pass)
+
+        self.btn_login = ttk.Button(auth_frame, text="Войти", command=self.login)
+        self.btn_login.grid(row=2, column=0, columnspan=2, pady=5)
+
+        # Параметры
+        parse_frame = ttk.LabelFrame(self.root, text="Параметры", padding=10)
+        parse_frame.pack(fill="both", expand=True, padx=10, pady=5)
+
+        ttk.Label(parse_frame, text="API-эндпоинт (JSON):").pack(anchor="w")
+        self.entry_api = ttk.Entry(parse_frame, width=80)
+        self.entry_api.pack(fill="x", pady=2)
+        self.entry_api.insert(0, API_RUSSIA)
+        attach_clipboard(self.entry_api)
+
+        # Папка
+        folder_frame = ttk.Frame(parse_frame)
+        folder_frame.pack(fill="x", pady=5)
+        ttk.Label(folder_frame, text="Папка для сохранения:").pack(side="left")
+        self.entry_folder = ttk.Entry(folder_frame, width=50)
+        self.entry_folder.pack(side="left", padx=5)
+        self.entry_folder.insert(0, os.path.join(os.getcwd(), "parsed_data"))
+        attach_clipboard(self.entry_folder)
+        ttk.Button(folder_frame, text="Обзор…", command=self.browse_folder).pack(side="left")
+
+        # Фильтры
+        filter_frame = ttk.LabelFrame(parse_frame, text="Фильтры (пусто = все авто)", padding=5)
+        filter_frame.pack(fill="x", pady=5)
+
+        self.filter_vars = {}
+        fields = [
+            ("ddlmaker", "Марка (код)"),
+            ("ddlmodel", "Модель (код)"),
+            ("ddlfuel", "Топливо (код)"),
+            ("ddlbody", "Кузов (код)"),
+            ("ddltransmission", "КПП (код)"),
+            ("ddlhandle", "Руль (код)"),
+            ("txtcc", "Объём CC"),
+            ("txtyfrom", "Год от"),
+            ("txtyto", "Год до"),
+            ("txtpricefrom", "Цена от"),
+            ("txtpriceto", "Цена до"),
+            ("txtmilagef", "Пробег от"),
+            ("txtmilaget", "Пробег до"),
+        ]
+        for idx, (key, label) in enumerate(fields):
+            row, col = divmod(idx, 4)
+            ttk.Label(filter_frame, text=label).grid(row=row, column=col * 2, sticky="e", padx=2, pady=1)
+            var = tk.StringVar(value="")
+            entry = ttk.Entry(filter_frame, textvariable=var, width=10)
+            entry.grid(row=row, column=col * 2 + 1, padx=2, pady=1)
+            attach_clipboard(entry)
+            self.filter_vars[key] = var
+
+        # Кнопки
+        btn_frame = ttk.Frame(parse_frame)
+        btn_frame.pack(fill="x", pady=10)
+        ttk.Button(btn_frame, text="Начать парсинг", command=self.start_parsing_thread).pack(side="left")
+        ttk.Button(btn_frame, text="Очистить лог", command=self.clear_log).pack(side="left", padx=5)
+
+        # Лог
+        self.log_area = scrolledtext.ScrolledText(parse_frame, height=17, state="disabled")
+        self.log_area.pack(fill="both", expand=True)
+
+    def browse_folder(self):
+        folder = filedialog.askdirectory(title="Выберите папку для сохранения")
+        if folder:
+            self.entry_folder.delete(0, tk.END)
+            self.entry_folder.insert(0, folder)
+
+    def log(self, message):
+        self.log_area.config(state="normal")
+        self.log_area.insert(tk.END, message + "\n")
+        self.log_area.see(tk.END)
+        self.log_area.config(state="disabled")
+
+    def clear_log(self):
+        self.log_area.config(state="normal")
+        self.log_area.delete("1.0", tk.END)
+        self.log_area.config(state="disabled")
+
+    # ---------- Авторизация ----------
+    def login(self):
+        user = self.entry_user.get().strip()
+        pwd = self.entry_pass.get().strip()
+        if not user or not pwd:
+            messagebox.showwarning("Внимание", "Введите логин и пароль")
+            return
+
+        check_url = f"{BASE_URL}/jquerydata.asmx/Checkmember"
+        payload = json.dumps({"MID": user, "Password": pwd})
+        try:
+            self.log(f"Попытка входа для {user}...")
+            resp = self.session.post(
+                check_url, data=payload,
+                headers={"Content-Type": "application/json"}, timeout=20
+            )
+            self.log(f"HTTP {resp.status_code}")
+            if resp.status_code == 200:
+                try:
+                    result = resp.json().get("d", "")
+                except Exception:
+                    result = resp.text[:200]
+                if result and result != "0":
+                    self.log(f"Вход выполнен успешно (ответ: {result}).")
+                else:
+                    self.log("Сервер вернул '0' — неверные учётные данные.")
+            else:
+                self.log("Ошибка авторизации, проверьте поля.")
+        except Exception as e:
+            self.log(f"Ошибка при авторизации: {e}")
+
+    # ---------- Парсинг ----------
+    def start_parsing_thread(self):
+        api_url = self.entry_api.get().strip()
+        folder = self.entry_folder.get().strip()
+        if not api_url:
+            messagebox.showwarning("Внимание", "Введите API-эндпоинт")
+            return
+        if not folder:
+            messagebox.showwarning("Внимание", "Выберите папку для сохранения")
+            return
+        threading.Thread(target=self.parse_all, args=(api_url, folder), daemon=True).start()
+
+    def fetch_cars(self, api_url):
+        """POST к API, подробная диагностика ответа."""
+        payload = {key: var.get().strip() for key, var in self.filter_vars.items()}
+        self.log(f"POST {api_url}")
+        self.log(f"Фильтры: {payload}")
+
+        resp = self.session.post(
+            api_url,
+            data=json.dumps(payload),
+            headers={"Content-Type": "application/json"},
+            timeout=60,
+        )
+        self.log(f"HTTP {resp.status_code}, Content-Type: {resp.headers.get('Content-Type', '—')}")
+
+        if resp.status_code != 200:
+            self.log(f"Тело ответа (первые 500): {resp.text[:500]}")
+            raise RuntimeError(f"Сервер вернул HTTP {resp.status_code}")
+
+        text = resp.text.strip()
+        self.log(f"Длина ответа: {len(text)} символов")
+        self.log(f"Начало ответа: {text[:300]}")
+
+        # Внешний JSON
+        try:
+            raw = json.loads(text)
+        except json.JSONDecodeError as e:
+            self.log(f"Внешний JSON не разобрался: {e}")
+            self.log("Сохраняю сырой ответ в debug_response.txt")
+            with open("debug_response.txt", "w", encoding="utf-8") as f:
+                f.write(text)
+            raise
+
+        if not isinstance(raw, dict) or "d" not in raw:
+            self.log(f"В ответе нет поля 'd'. Ключи: {list(raw)[:10] if isinstance(raw, dict) else type(raw)}")
+            with open("debug_response.txt", "w", encoding="utf-8") as f:
+                f.write(text)
+            raise RuntimeError("Неожиданная структура JSON")
+
+        inner = raw["d"]
+
+        if inner is None:
+            self.log("Поле 'd' = null. Возможно, требуется авторизация или фильтры не дали результатов.")
+            return []
+
+        if isinstance(inner, list):
+            self.log("Поле 'd' уже список — возвращаю как есть.")
+            return inner
+
+        if isinstance(inner, str):
+            inner_str = inner.strip()
+            if not inner_str:
+                self.log("Поле 'd' — пустая строка.")
+                return []
+            try:
+                return json.loads(inner_str)
+            except json.JSONDecodeError as e:
+                self.log(f"Внутренний JSON не разобрался: {e}")
+                self.log(f"Начало 'd': {inner_str[:300]}")
+                with open("debug_response_inner.txt", "w", encoding="utf-8") as f:
+                    f.write(inner_str)
+                raise
+
+        self.log(f"Поле 'd' неожиданного типа: {type(inner)}")
+        return []
+
+    def parse_all(self, api_url, folder):
+        try:
+            if not os.path.exists(folder):
+                os.makedirs(folder)
+                self.log(f"Создана папка: {folder}")
+
+            cars = self.fetch_cars(api_url)
+            self.log(f"Получено автомобилей: {len(cars)}")
+            if not cars:
+                self.log("Список пуст. Проверьте фильтры или авторизацию.")
+                return
+
+            # JSON
+            json_path = os.path.join(folder, "cars.json")
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(cars, f, ensure_ascii=False, indent=2)
+            self.log(f"JSON сохранён: {json_path}")
+
+            # TXT
+            txt_path = os.path.join(folder, "cars.txt")
+            with open(txt_path, "w", encoding="utf-8") as f:
+                for i, car in enumerate(cars, 1):
+                    f.write(f"=== Авто {i} ===\n")
+                    f.write(f"Название: {car.get('ProductName', '')}\n")
+                    f.write(f"Марка: {car.get('Makers', '')}\n")
+                    f.write(f"BIZ ID: {car.get('ID', '')}\n")
+                    f.write(f"Год: {car.get('Rdate', '')}\n")
+                    f.write(f"Пробег: {car.get('Mileage', '')} км\n")
+                    f.write(f"Топливо: {car.get('Fuel', '')}\n")
+                    f.write(f"Руль: {car.get('Handle', '')}\n")
+                    f.write(f"КПП: {car.get('Transmission', '')}\n")
+                    f.write(f"Объём: {car.get('CC', '')} CC\n")
+                    f.write(f"Цена: {car.get('Ctype', '')}{car.get('Price', '')}\n")
+                    f.write(f"Фото: {IMG_BASE}{car.get('Iname', '')}\n\n")
+            self.log(f"Текст сохранён: {txt_path}")
+
+            # CSV
+            csv_path = os.path.join(folder, "cars.csv")
+            keys = ["ID", "ProductName", "Makers", "Rdate", "Mileage", "Fuel",
+                    "Handle", "Transmission", "CC", "Ctype", "Price", "Iname", "NPID"]
+            with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=keys, extrasaction="ignore")
+                writer.writeheader()
+                for car in cars:
+                    writer.writerow(car)
+            self.log(f"CSV сохранён: {csv_path}")
+
+            # Изображения
+            img_dir = os.path.join(folder, "images")
+            os.makedirs(img_dir, exist_ok=True)
+            self.log(f"Скачивание изображений в {img_dir}...")
+            for i, car in enumerate(cars, 1):
+                iname = car.get("Iname")
+                if not iname:
+                    continue
+                img_url = f"{IMG_BASE}{iname}"
+                try:
+                    r = self.session.get(img_url, timeout=20)
+                    if r.status_code == 200 and r.content:
+                        ext = os.path.splitext(iname)[1] or ".jpg"
+                        car_id = str(car.get("ID", i)).replace("/", "-")
+                        fname = os.path.join(img_dir, f"{car_id}{ext}")
+                        with open(fname, "wb") as f:
+                            f.write(r.content)
+                        if i % 10 == 0 or i == len(cars):
+                            self.log(f"[{i}/{len(cars)}] скачано фото")
+                    else:
+                        self.log(f"Фото не получено: {img_url} (HTTP {r.status_code})")
+                except Exception as e:
+                    self.log(f"Ошибка скачивания {img_url}: {e}")
+                time.sleep(0.2)
+
+            self.log("Парсинг завершён.")
+        except requests.exceptions.HTTPError as e:
+            self.log(f"HTTP-ошибка: {e}")
+        except json.JSONDecodeError as e:
+            self.log(f"Ошибка разбора JSON: {e}")
+        except Exception as e:
+            self.log(f"Критическая ошибка: {e}")
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = BizuponParserApp(root)
+    root.mainloop()
