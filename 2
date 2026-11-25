@@ -1,0 +1,506 @@
+import tkinter as tk
+from tkinter import ttk, messagebox, scrolledtext, filedialog
+import requests
+import os
+import json
+import csv
+import threading
+import time
+from http.cookies import SimpleCookie
+
+BASE_URL = "https://www.bizupon.com"
+IMG_BASE = f"{BASE_URL}/car/small/"
+
+# Эндпоинты, найденные в JS сайта
+ENDPOINTS = {
+    "Russiahsearch (фильтры)":      f"{BASE_URL}/jquerydata.asmx/Russiahsearch",
+    "bindallproduct (все авто)":    f"{BASE_URL}/jquerydata.asmx/bindallproduct",
+    "Makersearch (по марке)":       f"{BASE_URL}/jquerydata.asmx/Makersearch",
+    "RussiaMakersearch (RU марка)": f"{BASE_URL}/jquerydata.asmx/RussiaMakersearch",
+    "NewRussiaProductByID (по ID)": f"{BASE_URL}/jquerydata.asmx/NewRussiaProductByID",
+    "hsearch (общий поиск)":        f"{BASE_URL}/jquerydata.asmx/hsearch",
+    "RussiaBodysearch (по кузову)": f"{BASE_URL}/jquerydata.asmx/RussiaBodysearch",
+}
+
+
+def _select_all(widget):
+    widget.selection_range(0, tk.END)
+    widget.icursor(tk.END)
+
+
+def attach_clipboard(widget):
+    menu = tk.Menu(widget, tearoff=0)
+    menu.add_command(label="Вырезать", command=lambda: widget.event_generate("<<Cut>>"))
+    menu.add_command(label="Копировать", command=lambda: widget.event_generate("<<Copy>>"))
+    menu.add_command(label="Вставить", command=lambda: widget.event_generate("<<Paste>>"))
+    menu.add_separator()
+    menu.add_command(label="Выделить всё", command=lambda: _select_all(widget))
+
+    def show_menu(event):
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    widget.bind("<Button-3>", show_menu)
+    widget.bind("<Button-2>", show_menu)
+    widget.bind("<Control-v>", lambda e: widget.event_generate("<<Paste>>"))
+    widget.bind("<Control-V>", lambda e: widget.event_generate("<<Paste>>"))
+    widget.bind("<Shift-Insert>", lambda e: widget.event_generate("<<Paste>>"))
+    widget.bind("<Control-c>", lambda e: widget.event_generate("<<Copy>>"))
+    widget.bind("<Control-C>", lambda e: widget.event_generate("<<Copy>>"))
+    widget.bind("<Control-Insert>", lambda e: widget.event_generate("<<Copy>>"))
+    widget.bind("<Control-x>", lambda e: widget.event_generate("<<Cut>>"))
+    widget.bind("<Control-X>", lambda e: widget.event_generate("<<Cut>>"))
+    widget.bind("<Control-a>", lambda e: _select_all(widget))
+    widget.bind("<Control-A>", lambda e: _select_all(widget))
+
+
+def attach_log_clipboard(widget):
+    menu = tk.Menu(widget, tearoff=0)
+    menu.add_command(label="Копировать", command=lambda: widget.event_generate("<<Copy>>"))
+    menu.add_separator()
+    menu.add_command(label="Выделить всё", command=lambda: _select_all(widget))
+    menu.add_command(label="Очистить лог", command=lambda: widget.delete("1.0", tk.END))
+
+    def show_menu(event):
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    widget.bind("<Button-3>", show_menu)
+    widget.bind("<Button-2>", show_menu)
+    widget.bind("<Control-c>", lambda e: widget.event_generate("<<Copy>>"))
+    widget.bind("<Control-C>", lambda e: widget.event_generate("<<Copy>>"))
+    widget.bind("<Control-Insert>", lambda e: widget.event_generate("<<Copy>>"))
+    widget.bind("<Control-a>", lambda e: _select_all(widget))
+    widget.bind("<Control-A>", lambda e: _select_all(widget))
+    widget.bind("<Key>", lambda e: "break" if e.keysym not in (
+        "Left", "Right", "Up", "Down", "Home", "End", "Prior", "Next",
+        "Shift_L", "Shift_R", "Control_L", "Control_R"
+    ) else None)
+
+
+class BizuponParserApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Bizupon Parser (API + Cookie)")
+        self.root.geometry("840x880")
+
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) "
+                          "Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/javascript, */*; q=0.01",
+            "X-Requested-With": "XMLHttpRequest",
+            "Origin": BASE_URL,
+            "Referer": f"{BASE_URL}/ourstock",
+        })
+
+        self.create_widgets()
+
+    # ---------- UI ----------
+    def create_widgets(self):
+        # Cookie
+        cookie_frame = ttk.LabelFrame(
+            self.root,
+            text="Cookie авторизации (вставьте строку Cookie из браузера)",
+            padding=10
+        )
+        cookie_frame.pack(fill="x", padx=10, pady=5)
+
+        ttk.Label(
+            cookie_frame,
+            text="Формат: name=value; name2=value2 (DevTools → Network → запрос → Request Headers → Cookie)",
+            foreground="gray"
+        ).pack(anchor="w")
+
+        self.txt_cookie = tk.Text(cookie_frame, height=3, wrap="word")
+        self.txt_cookie.pack(fill="x", pady=5)
+        attach_clipboard(self.txt_cookie)
+
+        btn_cookie = ttk.Frame(cookie_frame)
+        btn_cookie.pack(fill="x")
+        ttk.Button(btn_cookie, text="Применить cookie", command=self.apply_cookie).pack(side="left")
+        ttk.Button(btn_cookie, text="Проверить сессию", command=self.check_session_thread).pack(side="left", padx=5)
+        ttk.Button(btn_cookie, text="Очистить", command=lambda: self.txt_cookie.delete("1.0", tk.END)).pack(side="left")
+
+        # Параметры
+        parse_frame = ttk.LabelFrame(self.root, text="Параметры", padding=10)
+        parse_frame.pack(fill="both", expand=True, padx=10, pady=5)
+
+        # Эндпоинт + MID
+        ep_frame = ttk.Frame(parse_frame)
+        ep_frame.pack(fill="x", pady=2)
+        ttk.Label(ep_frame, text="Эндпоинт:").pack(side="left")
+        self.var_endpoint = tk.StringVar(value=list(ENDPOINTS.keys())[0])
+        combo = ttk.Combobox(ep_frame, textvariable=self.var_endpoint,
+                             values=list(ENDPOINTS.keys()), state="readonly", width=32)
+        combo.pack(side="left", padx=5)
+        combo.bind("<<ComboboxSelected>>", self._on_endpoint_change)
+
+        ttk.Label(ep_frame, text="MID / ID:").pack(side="left", padx=(15, 2))
+        self.entry_mid = ttk.Entry(ep_frame, width=15)
+        self.entry_mid.pack(side="left")
+        attach_clipboard(self.entry_mid)
+        ttk.Label(ep_frame, text="(нужен для Makersearch / ByID)", foreground="gray").pack(side="left", padx=5)
+
+        ttk.Label(parse_frame, text="API-эндпоинт (URL):").pack(anchor="w", pady=(6, 0))
+        self.entry_api = ttk.Entry(parse_frame, width=80)
+        self.entry_api.pack(fill="x", pady=2)
+        self.entry_api.insert(0, ENDPOINTS[self.var_endpoint.get()])
+        attach_clipboard(self.entry_api)
+
+        folder_frame = ttk.Frame(parse_frame)
+        folder_frame.pack(fill="x", pady=5)
+        ttk.Label(folder_frame, text="Папка для сохранения:").pack(side="left")
+        self.entry_folder = ttk.Entry(folder_frame, width=50)
+        self.entry_folder.pack(side="left", padx=5)
+        self.entry_folder.insert(0, os.path.join(os.getcwd(), "parsed_data"))
+        attach_clipboard(self.entry_folder)
+        ttk.Button(folder_frame, text="Обзор…", command=self.browse_folder).pack(side="left")
+
+        filter_frame = ttk.LabelFrame(parse_frame, text="Фильтры (для Russiahsearch, пусто = все авто)", padding=5)
+        filter_frame.pack(fill="x", pady=5)
+
+        self.filter_vars = {}
+        fields = [
+            ("ddlmaker", "Марка (код)"),
+            ("ddlmodel", "Модель (код)"),
+            ("ddlfuel", "Топливо (код)"),
+            ("ddlbody", "Кузов (код)"),
+            ("ddltransmission", "КПП (код)"),
+            ("ddlhandle", "Руль (код)"),
+            ("txtcc", "Объём CC"),
+            ("txtyfrom", "Год от"),
+            ("txtyto", "Год до"),
+            ("txtpricefrom", "Цена от"),
+            ("txtpriceto", "Цена до"),
+            ("txtmilagef", "Пробег от"),
+            ("txtmilaget", "Пробег до"),
+        ]
+        for idx, (key, label) in enumerate(fields):
+            row, col = divmod(idx, 4)
+            ttk.Label(filter_frame, text=label).grid(row=row, column=col * 2, sticky="e", padx=2, pady=1)
+            var = tk.StringVar(value="")
+            entry = ttk.Entry(filter_frame, textvariable=var, width=10)
+            entry.grid(row=row, column=col * 2 + 1, padx=2, pady=1)
+            attach_clipboard(entry)
+            self.filter_vars[key] = var
+
+        btn_frame = ttk.Frame(parse_frame)
+        btn_frame.pack(fill="x", pady=10)
+        ttk.Button(btn_frame, text="Начать парсинг", command=self.start_parsing_thread).pack(side="left")
+        ttk.Button(btn_frame, text="Автоподбор эндпоинта", command=self.autodetect_thread).pack(side="left", padx=5)
+        ttk.Button(btn_frame, text="Очистить лог", command=self.clear_log).pack(side="left", padx=5)
+        ttk.Button(btn_frame, text="Копировать лог", command=self.copy_log).pack(side="left")
+
+        self.log_area = scrolledtext.ScrolledText(parse_frame, height=15, state="normal")
+        self.log_area.pack(fill="both", expand=True)
+        attach_log_clipboard(self.log_area)
+
+    def _on_endpoint_change(self, event=None):
+        name = self.var_endpoint.get()
+        self.entry_api.delete(0, tk.END)
+        self.entry_api.insert(0, ENDPOINTS.get(name, ""))
+
+    def browse_folder(self):
+        folder = filedialog.askdirectory(title="Выберите папку для сохранения")
+        if folder:
+            self.entry_folder.delete(0, tk.END)
+            self.entry_folder.insert(0, folder)
+
+    def log(self, message):
+        self.log_area.insert(tk.END, message + "\n")
+        self.log_area.see(tk.END)
+
+    def clear_log(self):
+        self.log_area.delete("1.0", tk.END)
+
+    def copy_log(self):
+        text = self.log_area.get("1.0", tk.END).strip()
+        if text:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            self.log("Лог скопирован в буфер обмена.")
+
+    # ---------- Cookie ----------
+    def parse_cookie_string(self, raw):
+        cookies = {}
+        raw = raw.strip()
+        if not raw:
+            return cookies
+        if raw.lower().startswith("cookie:"):
+            raw = raw[len("cookie:"):].strip()
+        try:
+            sc = SimpleCookie()
+            sc.load(raw)
+            for key, morsel in sc.items():
+                cookies[key] = morsel.value
+        except Exception:
+            for part in raw.split(";"):
+                part = part.strip()
+                if "=" in part:
+                    k, v = part.split("=", 1)
+                    cookies[k.strip()] = v.strip()
+        return cookies
+
+    def apply_cookie(self):
+        raw = self.txt_cookie.get("1.0", tk.END).strip()
+        if not raw:
+            messagebox.showwarning("Внимание", "Вставьте строку Cookie")
+            return
+        cookies = self.parse_cookie_string(raw)
+        if not cookies:
+            self.log("Не удалось разобрать cookie. Проверьте формат.")
+            return
+        self.session.cookies.clear()
+        for name, value in cookies.items():
+            for domain in (".bizupon.com", "www.bizupon.com", ".bizuponusers.com"):
+                self.session.cookies.set(name, value, domain=domain)
+        self.log(f"Применено cookie: {len(cookies)} шт. ({', '.join(list(cookies)[:5])}{'...' if len(cookies) > 5 else ''})")
+
+    # ---------- Проверка сессии ----------
+    def check_session_thread(self):
+        threading.Thread(target=self.check_session, daemon=True).start()
+
+    def check_session(self):
+        try:
+            self.log("Проверка сессии (пробный запрос к Russiahsearch)...")
+            payload = {key: "" for key in self.filter_vars}
+            resp = self.session.post(
+                ENDPOINTS["Russiahsearch (фильтры)"],
+                data=json.dumps(payload),
+                headers={"Content-Type": "application/json"},
+                timeout=30,
+            )
+            ct = resp.headers.get("Content-Type", "")
+            self.log(f"HTTP {resp.status_code}, Content-Type: {ct}")
+            if "json" in ct.lower():
+                raw = resp.json()
+                inner = raw.get("d", "[]")
+                if isinstance(inner, str):
+                    cars = json.loads(inner) if inner.strip() else []
+                elif isinstance(inner, list):
+                    cars = inner
+                else:
+                    cars = []
+                if cars:
+                    self.log(f"Сессия активна. Получено автомобилей: {len(cars)}")
+                else:
+                    self.log("Сервер вернул JSON, но список пуст. Попробуйте «Автоподбор эндпоинта».")
+            else:
+                self.log("Сервер вернул НЕ JSON. Cookie недействительны (редирект на логин).")
+                self.log(f"Начало ответа: {resp.text[:200]}")
+        except Exception as e:
+            self.log(f"Ошибка проверки сессии: {e}")
+
+    # ---------- Автоподбор ----------
+    def autodetect_thread(self):
+        threading.Thread(target=self.autodetect, daemon=True).start()
+
+    def _try_endpoint(self, name, url, mid=""):
+        """Пробует один эндпоинт, возвращает (name, cars) или (name, None)."""
+        try:
+            if name.startswith("Russiahsearch"):
+                payload = {key: var.get().strip() for key, var in self.filter_vars.items()}
+            elif "Bodysearch" in name:
+                payload = {"shop": ""}
+            else:
+                payload = {"MID": mid or "0"}
+
+            resp = self.session.post(
+                url, data=json.dumps(payload),
+                headers={"Content-Type": "application/json"}, timeout=30
+            )
+            ct = resp.headers.get("Content-Type", "")
+            if "json" not in ct.lower():
+                self.log(f"  [{name}] не JSON (Content-Type: {ct})")
+                return name, None
+            raw = resp.json()
+            inner = raw.get("d", "")
+            if inner is None or inner == "":
+                self.log(f"  [{name}] пустой 'd'")
+                return name, None
+            if isinstance(inner, list):
+                cars = inner
+            else:
+                try:
+                    cars = json.loads(inner)
+                except Exception:
+                    self.log(f"  [{name}] 'd' не разобрался как JSON")
+                    return name, None
+            if isinstance(cars, list) and cars:
+                self.log(f"  [{name}] УСПЕХ: {len(cars)} авто")
+                return name, cars
+            self.log(f"  [{name}] пустой список")
+            return name, None
+        except Exception as e:
+            self.log(f"  [{name}] ошибка: {e}")
+            return name, None
+
+    def autodetect(self):
+        self.log("=== Автоподбор эндпоинта ===")
+        mid = self.entry_mid.get().strip()
+        for name, url in ENDPOINTS.items():
+            self.log(f"Пробую: {name}")
+            found_name, cars = self._try_endpoint(name, url, mid)
+            if cars:
+                self.log(f"Рабочий эндпоинт: {found_name} ({len(cars)} авто)")
+                # Обновляем UI
+                self.var_endpoint.set(found_name)
+                self._on_endpoint_change()
+                return
+        self.log("Ни один эндпоинт не вернул данные. Проверьте cookie и MID.")
+        self.log("Подсказка: для Makersearch укажите MID (код марки), для ByID — ID авто.")
+
+    # ---------- Парсинг ----------
+    def start_parsing_thread(self):
+        api_url = self.entry_api.get().strip()
+        folder = self.entry_folder.get().strip()
+        if not api_url:
+            messagebox.showwarning("Внимание", "Введите API-эндпоинт")
+            return
+        if not folder:
+            messagebox.showwarning("Внимание", "Выберите папку для сохранения")
+            return
+        threading.Thread(target=self.parse_all, args=(api_url, folder), daemon=True).start()
+
+    def build_payload(self, api_url):
+        name = self.var_endpoint.get()
+        mid = self.entry_mid.get().strip()
+        if name.startswith("Russiahsearch") or name.startswith("hsearch"):
+            return {key: var.get().strip() for key, var in self.filter_vars.items()}
+        if "Bodysearch" in name:
+            return {"shop": ""}
+        # Makersearch / RussiaMakersearch / ByID / bindallproduct
+        return {"MID": mid or "0"}
+
+    def fetch_cars(self, api_url, folder):
+        payload = self.build_payload(api_url)
+        self.log(f"POST {api_url}")
+        self.log(f"Payload: {payload}")
+
+        resp = self.session.post(
+            api_url,
+            data=json.dumps(payload),
+            headers={"Content-Type": "application/json"},
+            timeout=60,
+        )
+        ct = resp.headers.get("Content-Type", "—")
+        self.log(f"HTTP {resp.status_code}, Content-Type: {ct}")
+
+        if resp.status_code != 200:
+            self.log(f"Тело ответа (первые 500): {resp.text[:500]}")
+            raise RuntimeError(f"Сервер вернул HTTP {resp.status_code}")
+
+        text = resp.text.strip()
+        self.log(f"Длина ответа: {len(text)} символов")
+        self.log(f"Начало ответа: {text[:300]}")
+
+        if "json" not in ct.lower():
+            debug_path = os.path.join(folder, "debug_response.txt")
+            with open(debug_path, "w", encoding="utf-8") as f:
+                f.write(text)
+            self.log(f"Ответ не JSON. Сохранён: {debug_path}")
+            return []
+
+        try:
+            raw = json.loads(text)
+        except json.JSONDecodeError as e:
+            self.log(f"Внешний JSON не разобрался: {e}")
+            debug_path = os.path.join(folder, "debug_response.txt")
+            with open(debug_path, "w", encoding="utf-8") as f:
+                f.write(text)
+            self.log(f"Сырой ответ сохранён: {debug_path}")
+            return []
+
+        inner = raw.get("d", "") if isinstance(raw, dict) else ""
+        if inner is None or inner == "":
+            self.log("Поле 'd' пустое. Попробуйте «Автоподбор эндпоинта» или укажите MID.")
+            return []
+        if isinstance(inner, list):
+            return inner
+        if isinstance(inner, str):
+            try:
+                return json.loads(inner)
+            except json.JSONDecodeError as e:
+                self.log(f"Внутренний JSON не разобрался: {e}")
+                debug_path = os.path.join(folder, "debug_response_inner.txt")
+                with open(debug_path, "w", encoding="utf-8") as f:
+                    f.write(inner)
+                return []
+        return []
+
+    def parse_all(self, api_url, folder):
+        try:
+            if not os.path.exists(folder):
+                os.makedirs(folder)
+                self.log(f"Создана папка: {folder}")
+
+            cars = self.fetch_cars(api_url, folder)
+            self.log(f"Получено автомобилей: {len(cars)}")
+            if not cars:
+                self.log("Список пуст. Нажмите «Автоподбор эндпоинта» или проверьте MID/фильтры.")
+                return
+
+            json_path = os.path.join(folder, "cars.json")
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(cars, f, ensure_ascii=False, indent=2)
+            self.log(f"JSON сохранён: {json_path}")
+
+            txt_path = os.path.join(folder, "cars.txt")
+            with open(txt_path, "w", encoding="utf-8") as f:
+                for i, car in enumerate(cars, 1):
+                    f.write(f"=== Авто {i} ===\n")
+                    for k in ("ProductName", "Makers", "ID", "Rdate", "Mileage",
+                              "Fuel", "Handle", "Transmission", "CC", "Ctype", "Price"):
+                        f.write(f"{k}: {car.get(k, '')}\n")
+                    f.write(f"Фото: {IMG_BASE}{car.get('Iname', '')}\n\n")
+            self.log(f"Текст сохранён: {txt_path}")
+
+            csv_path = os.path.join(folder, "cars.csv")
+            keys = ["ID", "ProductName", "Makers", "Rdate", "Mileage", "Fuel",
+                    "Handle", "Transmission", "CC", "Ctype", "Price", "Iname", "NPID"]
+            with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=keys, extrasaction="ignore")
+                writer.writeheader()
+                for car in cars:
+                    writer.writerow(car)
+            self.log(f"CSV сохранён: {csv_path}")
+
+            img_dir = os.path.join(folder, "images")
+            os.makedirs(img_dir, exist_ok=True)
+            self.log(f"Скачивание изображений в {img_dir}...")
+            for i, car in enumerate(cars, 1):
+                iname = car.get("Iname")
+                if not iname:
+                    continue
+                img_url = f"{IMG_BASE}{iname}"
+                try:
+                    r = self.session.get(img_url, timeout=20)
+                    if r.status_code == 200 and r.content:
+                        ext = os.path.splitext(iname)[1] or ".jpg"
+                        car_id = str(car.get("ID", i)).replace("/", "-")
+                        fname = os.path.join(img_dir, f"{car_id}{ext}")
+                        with open(fname, "wb") as f:
+                            f.write(r.content)
+                        if i % 10 == 0 or i == len(cars):
+                            self.log(f"[{i}/{len(cars)}] скачано фото")
+                    else:
+                        self.log(f"Фото не получено: {img_url} (HTTP {r.status_code})")
+                except Exception as e:
+                    self.log(f"Ошибка скачивания {img_url}: {e}")
+                time.sleep(0.2)
+
+            self.log("Парсинг завершён.")
+        except Exception as e:
+            self.log(f"Критическая ошибка: {e}")
+
+
+if __name__ == "__main__":
+    root = tk.Tk()
+    app = BizuponParserApp(root)
+    root.mainloop()
